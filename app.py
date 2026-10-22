@@ -59,6 +59,7 @@ class AirLLMEngine:
     def __init__(self) -> None:
         self.model: Any | None = None
         self.model_name: str | None = None
+        self.device: str | None = None
         self.lock = threading.Lock()
 
     def load(self, model_name: str, compression: str | None = None) -> None:
@@ -79,6 +80,16 @@ class AirLLMEngine:
             kwargs = {}
             device = "cuda:0" if torch.cuda.is_available() else "cpu"
             kwargs["device"] = device
+            if device == "cpu":
+                # CPU-only machines benefit from bounded parallelism and do
+                # not benefit from AirLLM's GPU prefetch path.
+                try:
+                    torch.set_num_threads(max(1, min(8, (os.cpu_count() or 2) - 1)))
+                    torch.set_num_interop_threads(1)
+                except RuntimeError:
+                    pass
+                kwargs["prefetching"] = False
+                kwargs["max_seq_len"] = 512
             terminal_log(f"AirLLM inference device: {device}", "INFO")
             if compression in {"4bit", "8bit"}:
                 kwargs["compression"] = compression
@@ -96,6 +107,7 @@ class AirLLMEngine:
             with capture_runtime_output():
                 self.model = AutoModel.from_pretrained(model_name, **kwargs)
             self.model_name = model_name
+            self.device = device
             update_status("ready", 60, "Model loaded and ready")
 
     def reply(
@@ -112,19 +124,22 @@ class AirLLMEngine:
         prompt = "\n".join(
             f"{item['role'].title()}: {item['content']}" for item in messages
         ) + "\nAssistant:"
+        import torch
+        context_limit = 1024 if self.device == "cpu" else 4096
+        output_limit = min(max_new_tokens, 128) if self.device == "cpu" else max_new_tokens
         inputs = tokenizer(
             [prompt],
             return_tensors="pt",
             return_attention_mask=False,
             truncation=True,
-            max_length=4096,
+            max_length=context_limit,
             padding=False,
         )
         update_status("generating", 78, "Generating response")
-        with capture_runtime_output():
+        with capture_runtime_output(), torch.inference_mode():
             generation = self.model.generate(
                 inputs["input_ids"].to(self.model.device),
-                max_new_tokens=max_new_tokens,
+                max_new_tokens=output_limit,
                 use_cache=True,
                 return_dict_in_generate=True,
             )
@@ -481,6 +496,7 @@ PAGE = r"""
     [['midnight','Midnight blue'],['rose','Rose glass'],['graphite','Graphite'],['aurora','Aurora glass']].forEach(([value,label])=>{ const select=document.getElementById('themeInput'); if(select&&!select.querySelector('option[value="'+value+'"]')) select.insertAdjacentHTML('beforeend','<option value="'+value+'">'+label+'</option>'); });
     const stableApplyPreferences=()=>{ const theme=localStorage.getItem('air-theme')||'light'; const pattern=localStorage.getItem('air-pattern')||'none'; const font=localStorage.getItem('air-font')||'normal'; const motion=localStorage.getItem('air-motion')||'full'; const compact=localStorage.getItem('air-compact')==='true'; document.body.classList.remove('dark','sepia','ocean','lavender','forest','sunset','obsidian','midnight','rose','graphite','aurora','pattern-grid','pattern-dots','pattern-diamonds','pattern-waves','large-text','compact','reduced'); if(theme!=='light') document.body.classList.add(theme); if(pattern!=='none') document.body.classList.add('pattern-'+pattern); if(font==='large') document.body.classList.add('large-text'); if(compact) document.body.classList.add('compact'); if(motion==='reduced') document.body.classList.add('reduced'); document.getElementById('themeInput').value=theme; document.getElementById('patternInput').value=pattern; document.getElementById('fontInput').value=font; document.getElementById('motionInput').value=motion; document.getElementById('compactInput').checked=compact; document.getElementById('enterInput').checked=localStorage.getItem('air-enter')!=='false'; };
     applyPreferences=stableApplyPreferences;
+    if(document.getElementById('tokens') && document.getElementById('tokens').value==='256') document.getElementById('tokens').value='96';
     let pollInFlight=false;
     pollStatus=async function(){ if(pollInFlight) return; pollInFlight=true; const controller=new AbortController(); const timeout=setTimeout(()=>controller.abort(),9000); try { const s=await (await fetch('/api/status?ts='+Date.now(),{cache:'no-store',signal:controller.signal})).json(); const terminalData=await (await fetch('/api/terminal?ts='+Date.now(),{cache:'no-store',signal:controller.signal})).json(); const lines=Array.isArray(terminalData.lines)?terminalData.lines:[]; document.getElementById('progressBar').style.width=(Number(s.progress)||0)+'%'; document.getElementById('progressBar').classList.toggle('busy',!!s.busy); document.getElementById('status').textContent=s.message||'AirLLM ready'; document.getElementById('progressLabel').textContent=s.message||'Idle'; document.getElementById('terminalStatus').textContent=(s.phase||'idle').toUpperCase()+' · '+(s.progress||0)+'% · LIVE'; document.getElementById('thinkingText').textContent=s.message||'AirLLM is standing by.'; document.getElementById('thinkingBox').classList.toggle('visible',!!s.busy); const terminal=document.getElementById('terminal'); terminal.classList.toggle('active-output',!!s.busy); terminal.innerHTML=lines.length?lines.map(line=>'<div class="terminal-line">'+escapeHtml(String(line))+'</div>').join(''):'<div class="terminal-empty">Waiting for backend output…</div>'; terminal.scrollTop=terminal.scrollHeight; } catch(e){ document.getElementById('terminalStatus').textContent='RECONNECTING · retrying'; if(!document.querySelector('.terminal-line')) document.getElementById('terminal').innerHTML='<div class="terminal-empty">Waiting for AirLLM-Go backend output…</div>'; } finally { clearTimeout(timeout); pollInFlight=false; setTimeout(pollStatus,800); } };
     applyPreferences();
@@ -621,7 +637,7 @@ def chat():
             messages,
             selected_model,
             data.get("compression") or None,
-            int(data.get("max_new_tokens", 256)),
+            int(data.get("max_new_tokens", 96)),
         )
         item["messages"] = messages + [{"role": "assistant", "content": reply}]
         item["model"] = selected_model
@@ -638,11 +654,19 @@ def chat():
 
 @app.get("/api/health")
 def health():
+    try:
+        import torch
+        device = "cuda:0" if torch.cuda.is_available() else "cpu"
+        cuda = bool(torch.cuda.is_available())
+    except ImportError:
+        device, cuda = "unknown", False
     return jsonify(
         status="ok",
         python=os.sys.version.split()[0],
         airllm_loaded=engine.model is not None,
         model=engine.model_name,
+        device=device,
+        cuda_available=cuda,
     )
 
 
