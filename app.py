@@ -136,7 +136,9 @@ class AirLLMEngine:
             padding=False,
         )
         update_status("generating", 78, "Generating response")
-        with capture_runtime_output(), torch.inference_mode():
+        # AirLLM swaps layer parameters between CPU and meta during forward;
+        # no_grad is safer than inference_mode for those dynamic hooks.
+        with capture_runtime_output(), torch.no_grad():
             generation = self.model.generate(
                 inputs["input_ids"].to(self.model.device),
                 max_new_tokens=output_limit,
