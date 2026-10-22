@@ -70,12 +70,16 @@ class AirLLMEngine:
             try:
                 update_status("loading", 12, f"Loading {model_name}")
                 from airllm import AutoModel
+                import torch
             except ImportError as exc:
                 raise RuntimeError(
                     "AirLLM is not installed. Run: pip install -r requirements.txt"
                 ) from exc
 
             kwargs = {}
+            device = "cuda:0" if torch.cuda.is_available() else "cpu"
+            kwargs["device"] = device
+            terminal_log(f"AirLLM inference device: {device}", "INFO")
             if compression in {"4bit", "8bit"}:
                 kwargs["compression"] = compression
             cache_path = cache_path_from_config()
