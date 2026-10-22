@@ -1,0 +1,27 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.venv/
+.airenv/
+venv/
+
+# Local AirLLM state and large model assets
+airllm-go-config.json
+airllm-go-terminal.log
+conversations.json
+uploads/*
+generated/*
+*.safetensors
+*.bin
+*.pt
+*.pth
+
+# Local tooling and editor files
+.env
+.env.*
+.vscode/
+.idea/
+*.log
+Thumbs.db
+.DS_Store
